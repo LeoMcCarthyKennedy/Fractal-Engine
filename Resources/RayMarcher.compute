@@ -1,0 +1,466 @@
+﻿#include "Ray.cginc"
+#include "Objects.cginc"
+#include "Settings.cginc"
+
+#pragma kernel Main
+
+// ****************** output texture
+
+RWTexture2D<float4> renderTexture;
+
+// ****************** camera
+
+// value set by shader
+float3 cameraPosition;
+
+float4x4 cameraToWorldMatrix;
+float4x4 cameraProjectionMatrixInverse;
+
+// ****************** world
+
+bool hasSkybox;
+
+TextureCube<float4> skybox;
+SamplerState samplerskybox;
+
+float3 skyColor;
+float fogStrength;
+
+float3 glowColor;
+float glowStrength;
+
+// ****************** light
+
+float3 lightDirection;
+float3 lightColor;
+
+// ****************** fractal
+
+float3 fractalPosition;
+float3 fractalRotation;
+float3 fractalScale;
+
+int fractalType;
+float3 fractalParameters;
+
+float fractalShine;
+float fractalReflectiveness;
+
+float3 orbitColor;
+int orbitInitialValue;
+int orbitTrapFunction;
+
+// ****************** primitives
+
+StructuredBuffer<Primitive> primitives;
+int primitiveCount;
+
+// ****************** main code
+
+float3 GetCameraPosition(float4x4 cameraToWorldMatrix) {
+	return mul(cameraToWorldMatrix, float4(0, 0, 0, 1)).xyz;
+}
+
+float2 GetUV(float2 xy) {
+	uint width;
+	uint height;
+
+	renderTexture.GetDimensions(width, height);
+
+	return 2 * (xy / float2(width, height)) - 1;
+}
+
+float2 SmoothMin(float a, float b) {
+	// credit to https://iquilezles.org/articles/smin/
+
+	float h = clamp(0.5 * ((b - a) / SMOOTH) + 0.5, 0, 1);
+	float distance = lerp(b, a, h) - SMOOTH * h * (1 - h);
+
+	return float2(1 - h, distance);
+}
+
+float GetSceneDistance(float3 p) {
+	float minDistance = MAX_DISTANCE;
+
+	// ****************** primitive distance
+
+	for (int i = 0; i < primitiveCount; i++) {
+		float primitiveDistance = GetPrimitiveDistance(float4(p, 1), primitives[i]);
+
+		#if SMOOTH
+
+		if (i == 0) {
+			minDistance = primitiveDistance;
+		} else {
+			// smooth distance
+			minDistance = SmoothMin(minDistance, primitiveDistance).y;
+		}
+
+		#else
+
+		if (primitiveDistance < minDistance) {
+			minDistance = primitiveDistance;
+
+			if (minDistance <= MIN_DISTANCE) {
+				return minDistance;
+			}
+		}
+
+		#endif
+
+	}
+
+	// ****************** fractal distance
+
+	float fractalDistance = GetFractalDistance(float4(p, 1), fractalPosition, fractalRotation, fractalScale, fractalType, fractalParameters);
+
+	#if SMOOTH
+
+	if (minDistance == MAX_DISTANCE) {
+		minDistance = fractalDistance;
+	} else {
+		// smooth distance
+		minDistance = SmoothMin(minDistance, fractalDistance).y;
+	}
+
+	#else
+
+	if (fractalDistance < minDistance) {
+		minDistance = fractalDistance;
+	}
+
+	#endif
+
+	// ****************** distance
+
+	return minDistance;
+}
+
+float4 GetSceneData(float3 p, out float shine, out float reflectiveness) {
+	float3 color = 0;
+	float minDistance = MAX_DISTANCE;
+
+	shine = 0;
+	reflectiveness = 0;
+
+	// ****************** primitive data
+
+	for (int i = 0; i < primitiveCount; i++) {
+		float primitiveDistance = GetPrimitiveDistance(float4(p, 1), primitives[i]);
+
+		#if SMOOTH
+
+		if (i == 0) {
+			color = primitives[i].color;
+			minDistance = primitiveDistance;
+
+			shine = primitives[i].shine;
+			reflectiveness = primitives[i].reflectiveness;
+		} else {
+			float2 smooth = SmoothMin(minDistance, primitiveDistance);
+
+			// smooth distance and material
+
+			color = lerp(color, primitives[i].color, smooth.x);
+			minDistance = smooth.y;
+
+			shine = lerp(shine, primitives[i].shine, smooth.x);
+			reflectiveness = lerp(reflectiveness, primitives[i].reflectiveness, smooth.x);
+		}
+
+		#else
+
+		if (primitiveDistance < minDistance) {
+			color = primitives[i].color;
+			minDistance = primitiveDistance;
+
+			shine = primitives[i].shine;
+			reflectiveness = primitives[i].reflectiveness;
+
+			if (minDistance <= MIN_DISTANCE) {
+				return float4(color, minDistance);
+			}
+		}
+
+		#endif
+
+	}
+
+	// ****************** fractal data
+
+	float4 fractalData = GetFractalData(float4(p, 1), fractalPosition, fractalRotation, fractalScale, fractalType, fractalParameters, orbitColor, orbitInitialValue, orbitTrapFunction);
+
+	// clamp color
+	fractalData.rgb = clamp(fractalData.rgb, 0, 1);
+
+	#if SMOOTH
+
+	if (minDistance == MAX_DISTANCE) {
+		color = fractalData.rgb;
+		minDistance = fractalData.w;
+
+		shine = fractalShine;
+		reflectiveness = fractalReflectiveness;
+	} else {
+		float2 smooth = SmoothMin(minDistance, fractalData.w);
+
+		// smooth distance and material
+
+		color = lerp(color, fractalData.rgb, smooth.x);
+		minDistance = smooth.y;
+
+		shine = lerp(shine, fractalShine, smooth.x);
+		reflectiveness = lerp(reflectiveness, fractalReflectiveness, smooth.x);
+	}
+
+	#else
+
+	if (fractalData.w < minDistance) {
+		color = fractalData.rgb;
+		minDistance = fractalData.w;
+
+		shine = fractalShine;
+		reflectiveness = fractalReflectiveness;
+	}
+
+	#endif
+
+	// ****************** data
+
+	return float4(color, minDistance);
+}
+
+float4 March(inout Ray ray, float sharpness) {
+	float steps = 0;
+	float distance = 0;
+	float totalDistance = 0;
+	float minDistance = 1;
+
+	for (steps = 0; steps < MAX_STEPS; steps++) {
+		distance = GetSceneDistance(ray.origin);
+		totalDistance += distance;
+		minDistance = min(minDistance, sharpness * (distance / totalDistance));
+
+		// march ray
+		ray.origin += ray.direction * distance;
+
+		if (distance <= MIN_DISTANCE) {
+			return float4(steps + (distance / MIN_DISTANCE), distance, totalDistance, minDistance);
+		} else if (totalDistance >= MAX_DISTANCE) {
+			return float4(steps, distance, totalDistance, minDistance);
+		}
+	}
+
+	return float4(steps, distance, totalDistance, minDistance);
+}
+
+float3 GetNormal(float3 p) {
+	// credit to https://iquilezles.org/articles/normalsSDF/
+
+	const float3 q = float3(1, -1, 0);
+	const float r = MIN_DISTANCE * SURFACE_BIAS;
+
+	return normalize(
+		q.xyy * GetSceneDistance(p + q.xyy * r) +
+		q.yyx * GetSceneDistance(p + q.yyx * r) +
+		q.yxy * GetSceneDistance(p + q.yxy * r) +
+		q.xxx * GetSceneDistance(p + q.xxx * r)
+	);
+}
+
+float2 GetShadow(float3 p) {
+	Ray ray = CreateRay(p, -lightDirection);
+
+	float4 hit = March(ray, SHADOW_SHARPNESS);
+
+	if (hit.x >= MAX_STEPS || hit.y <= MIN_DISTANCE) {
+		// ray did not make it to the light source
+		return float2(SHADOW_AMBIENT, min(hit.w + SHADOW_AMBIENT, 1));
+	} else {
+		// ray made it to the light source
+		return float2(1, min(hit.w + SHADOW_AMBIENT, 1));
+	}
+}
+
+float4 GetSurface(float3 p, float3 normal) {
+	float shine;
+	float reflectiveness;
+
+	float3 color = GetSceneData(p, shine, reflectiveness).rgb;
+
+	#if SHADOWS
+
+	float2 shadow = GetShadow(p + normal * MIN_DISTANCE * SURFACE_BIAS);
+
+	#else
+
+	float2 shadow = 1;
+
+	#endif
+
+	float3 viewDirection = normalize(cameraPosition - p);
+	float3 reflectionDirection = reflect(lightDirection, normal);
+
+	// 3 term lighting model
+
+	float3 ambient = AMBIENT * color;
+	float3 diffuse = max(dot(normal, -lightDirection), 0) * color;
+	float3 specular = shadow.x * pow(max(dot(viewDirection, reflectionDirection), 0), SPECULAR_POWER) * shine;
+
+	return float4(shadow.y * (ambient + diffuse + specular) * lightColor, reflectiveness);
+}
+
+float3 GetSky(float3 direction, float minDistance) {
+	float3 glow = (1 - minDistance) * (1 - minDistance) * glowColor * glowStrength;
+
+	if (hasSkybox) {
+		// sample skybox
+		return lerp(skybox.SampleLevel(samplerskybox, direction, 0).rgb + glow, skyColor, min(fogStrength, 1));
+	} else {
+		return lerp(skyColor + glow, skyColor, min(fogStrength, 1));
+	}
+}
+
+float3 Render(Ray ray) {
+	float3 output = 0;
+
+	#if MAX_REFLECTIONS
+
+	// ****************** reflections
+
+	float factor = 1;
+
+	for (int i = 0; i < MAX_REFLECTIONS + 1; i++) {
+		float4 hit = March(ray, GLOW_SHARPNESS);
+
+		if (hit.x >= MAX_STEPS || hit.y <= MIN_DISTANCE) {
+			// hit scene
+
+			float3 normal = GetNormal(ray.origin - ray.direction * MIN_DISTANCE * SURFACE_BIAS);
+			float4 surface = GetSurface(ray.origin, normal);
+
+			float3 color = surface.rgb * (1 - surface.w);
+
+			#if AO
+
+			float ao = max(1 - ((hit.x / MAX_STEPS) * AO_STRENGTH), 0);
+
+			#else
+
+			float ao = 1;
+
+			#endif
+
+			float fog = (hit.z / MAX_DISTANCE) * fogStrength;
+
+			// exponential fog
+			fog *= fog;
+			fog = clamp(fog, 0, 1);
+
+			output += factor * lerp(color * ao, skyColor, fog);
+			factor *= surface.w;
+
+			// if not a reflective surface
+			if (surface.w == 0) {
+				break;
+			}
+
+			// reflect ray
+
+			ray.origin += normal * MIN_DISTANCE * SURFACE_BIAS;
+			ray.direction = reflect(ray.direction, normal);
+		} else {
+			// did not hit scene
+
+			output += factor * GetSky(ray.direction, hit.w);
+
+			break;
+		}
+	}
+
+	#else
+
+	// ****************** no reflections
+
+	float4 hit = March(ray, GLOW_SHARPNESS);
+
+	if (hit.x >= MAX_STEPS || hit.y <= MIN_DISTANCE) {
+		// hit scene
+
+		float3 normal = GetNormal(ray.origin - ray.direction * MIN_DISTANCE * SURFACE_BIAS);
+		float4 surface = GetSurface(ray.origin, normal);
+
+		float3 color = surface.rgb;
+
+		#if AO
+
+		float ao = max(1 - ((hit.x / MAX_STEPS) * AO_STRENGTH), 0);
+
+		#else
+
+		float ao = 1;
+
+		#endif
+
+		float fog = (hit.z / MAX_DISTANCE) * fogStrength;
+
+		// exponential fog
+		fog *= fog;
+		fog = clamp(fog, 0, 1);
+
+		output = lerp(color * ao, skyColor, fog);
+	} else {
+		// did not hit scene
+
+		output = GetSky(ray.direction, hit.w);
+	}
+
+	#endif
+
+	// ****************** final color
+
+	return output;
+}
+
+[numthreads(16, 16, 1)]
+void Main(uint3 id : SV_DispatchThreadID) {
+	cameraPosition = GetCameraPosition(cameraToWorldMatrix);
+
+	#if AA_SAMPLES
+
+	// ****************** anti-aliasing
+
+	float3 color = 0;
+
+	for (int x = 0; x < AA_SAMPLES + 1; x++) {
+		for (int y = 0; y < AA_SAMPLES + 1; y++) {
+			// slightly offset uv for each sample
+			float2 uv = GetUV(id.xy + (float2(x, y) / (AA_SAMPLES + 1)));
+
+			Ray ray = CreateCameraRay(cameraPosition, cameraToWorldMatrix, cameraProjectionMatrixInverse, uv);
+
+			color += Render(ray);
+		}
+	}
+
+	// output
+	renderTexture[id.xy] = float4(color / ((AA_SAMPLES + 1) * (AA_SAMPLES + 1)), 1);
+
+	#else
+
+	// ****************** no anti-aliasing
+
+	float3 color = 0;
+
+	float2 uv = GetUV(id.xy);
+
+	Ray ray = CreateCameraRay(cameraPosition, cameraToWorldMatrix, cameraProjectionMatrixInverse, uv);
+
+	color = Render(ray);
+
+	// output
+	renderTexture[id.xy] = float4(color, 1);
+
+	#endif
+
+}
